@@ -106,73 +106,84 @@ def textract_ocr_with_lines(image_path, client):
     return lines
 
 
-def extract_boxed_answer(lines):
-    """Detect the boxed answer region on a page using Textract geometry.
+def extract_boxed_answers(lines):
+    """Extract ONLY the text next to each 'Final Answer' label on a page.
 
-    Strategy: The answer box is typically an indented/bordered region.
-    Lines inside the box tend to be narrower (don't span full page width)
-    and are indented from the left margin compared to the question text.
+    Scans for lines containing 'Final Answer' and collects the nearby
+    answer text. Also looks backwards to find the question label
+    (e.g. '(1a)', '(2)', etc.).
 
-    We detect the box by looking for lines that are indented (left > 0.08)
-    or lines that appear after a significant vertical gap from the question.
-    The question text is the un-indented text at the top of the page.
+    Returns a list of (question_label, answer_text) tuples.
     """
     if not lines:
-        return "", ""
+        return []
 
-    if len(lines) == 1:
-        return "", lines[0]["text"]
-
-    # Compute the most common left margin (the "normal" margin for question text)
-    lefts = [l["left"] for l in lines]
-    # Question lines are typically at the leftmost margin
-    min_left = min(lefts)
-
-    # Find lines that are significantly indented (inside a box)
-    # or find the biggest vertical gap to split question from answer
-    # Approach: combine gap detection + indentation detection
-
-    # 1) Find biggest vertical gap
-    best_gap_idx = 0
-    best_gap = 0
-    for i in range(len(lines) - 1):
-        gap = lines[i + 1]["top"] - (lines[i]["top"] + lines[i]["height"])
-        if gap > best_gap:
-            best_gap = gap
-            best_gap_idx = i
-
-    # 2) Find indented lines (left margin > min_left + threshold)
-    indent_threshold = 0.03  # 3% of page width indentation
-    indented_start = None
+    # Find indices of every "Final Answer" label
+    fa_indices = []
     for i, l in enumerate(lines):
-        if l["left"] > min_left + indent_threshold:
-            indented_start = i
-            break
+        if re.search(r'final\s*answer', l["text"], re.IGNORECASE):
+            fa_indices.append(i)
 
-    # Decide split point: prefer indentation if found, else use gap
-    if indented_start is not None and indented_start > 0:
-        split_idx = indented_start
-    elif best_gap > 0.015:  # at least 1.5% page height gap
-        split_idx = best_gap_idx + 1
-    else:
-        # No clear separation: first 1-2 lines are question, rest is answer
-        split_idx = min(2, len(lines) - 1)
+    if not fa_indices:
+        return []   # no boxed answers on this page (cover page, formula sheet, etc.)
 
-    q_lines = lines[:split_idx]
-    a_lines = lines[split_idx:]
+    results = []
+    for k, fa_i in enumerate(fa_indices):
+        # --- Find the question label by scanning backwards ---
+        q_label = None
+        for j in range(fa_i - 1, -1, -1):
+            m = re.search(r'\((\d+[a-z]?)\)', lines[j]["text"])
+            if m:
+                q_label = m.group(1)    # e.g. "1a", "1b", "2"
+                break
+            # Also match "1." or "2." style at start of line
+            m2 = re.match(r'^(\d+)\.', lines[j]["text"].strip())
+            if m2:
+                q_label = m2.group(1)
+                break
+        if q_label is None:
+            q_label = "Q%d" % (k + 1)
 
-    question_text = " ".join(l["text"] for l in q_lines).strip()
-    answer_text = " ".join(l["text"] for l in a_lines).strip()
-    return question_text, answer_text
+        # --- Collect answer text after the "Final Answer" label ---
+        ans_lines = []
+
+        # Check if answer is on the SAME line as "Final Answer"
+        fa_text = lines[fa_i]["text"]
+        after = re.split(r'[Ff]inal\s*[Aa]nswer\s*:?\s*', fa_text)
+        if len(after) > 1 and after[-1].strip():
+            ans_lines.append(after[-1].strip())
+
+        # Walk lines after the label until next question or next Final Answer
+        stop = fa_indices[k + 1] if k + 1 < len(fa_indices) else len(lines)
+        for j in range(fa_i + 1, stop):
+            txt = lines[j]["text"].strip()
+            # Stop if we hit a new sub-question like "(1b)", "(2)", etc.
+            if re.match(r'^\(\d+[a-z]?\)', txt):
+                break
+            # Stop if we hit a new numbered question like "2."
+            if re.match(r'^\d+\.', txt):
+                break
+            ans_lines.append(txt)
+
+        answer = " ".join(ans_lines).strip()
+        if not answer:
+            answer = "[blank]"
+
+        results.append((q_label, answer))
+
+    return results
 
 
 def normalize_answer(text):
     """Normalize an answer string for exact-match grouping.
-    Lowercases, strips whitespace, removes extra spaces and punctuation differences.
+    Lowercases, strips whitespace, collapses spaces, removes only
+    trailing/leading punctuation (keeps math operators like = + - / *).
     """
     t = text.lower().strip()
     t = re.sub(r'\s+', ' ', t)          # collapse whitespace
-    t = re.sub(r'[^\w\s]', '', t)       # remove punctuation
+    t = re.sub(r'^[.,;:!?\s]+', '', t)  # strip leading punctuation
+    t = re.sub(r'[.,;:!?\s]+$', '', t)  # strip trailing punctuation
+    t = re.sub(r'\s+', '', t)           # remove ALL spaces for fuzzy match
     return t
 
 
@@ -392,8 +403,9 @@ def run_pipeline(pdf_paths, job_id):
         # Determine number of pages (use max across students)
         max_pages = max(len(imgs) for imgs in student_pages.values())
 
-        # page_data[page_idx] = list of (sid, answer_text, question_text, img_path)
-        page_data = defaultdict(list)
+        # q_data[question_label] = list of (sid, answer_text, img_path)
+        # Each "Final Answer" box becomes its own question, labeled 1a, 1b, etc.
+        q_data = defaultdict(list)
         done = 0
 
         for sid, imgs in student_pages.items():
@@ -405,32 +417,41 @@ def run_pipeline(pdf_paths, job_id):
                 _jobs[job_id]["progress"] = int(50 * done / max(total_pages, 1))
 
                 lines = textract_ocr_with_lines(img, textract)
-                _q_text, a_text = extract_boxed_answer(lines)
+                answers = extract_boxed_answers(lines)
 
-                page_data[pg_i].append((sid, a_text, _q_text, img))
+                for q_label, a_text in answers:
+                    q_data[q_label].append((sid, a_text, img))
+
                 done += 1
 
-        # Build question results — one per page
+        # Sort question labels naturally: 1a, 1b, 1c, 1d, 2, 3a, 3b, ...
+        def sort_key(label):
+            m = re.match(r'(\d+)([a-z]?)', label)
+            if m:
+                return (int(m.group(1)), m.group(2))
+            return (9999, label)
+
+        sorted_labels = sorted(q_data.keys(), key=sort_key)
+
+        # Build question results — one per Final Answer box
         questions_data = []
-        for pg_i in range(max_pages):
-            subs = page_data.get(pg_i, [])
+        for rank, q_label in enumerate(sorted_labels):
+            subs = q_data[q_label]
             if not subs:
                 continue
 
-            q_label = "Page %d" % (pg_i + 1)
-
-            _jobs[job_id]["message"] = "Grouping answers for %s..." % q_label
-            _jobs[job_id]["progress"] = 50 + int(50 * pg_i / max(max_pages, 1))
+            _jobs[job_id]["message"] = "Grouping answers for Q%s..." % q_label
+            _jobs[job_id]["progress"] = 50 + int(50 * rank / max(len(sorted_labels), 1))
 
             # Group identical boxed answers together
-            answer_subs = [(sid, a_text) for sid, a_text, _, _ in subs]
+            answer_subs = [(sid, a_text) for sid, a_text, _ in subs]
             result = group_by_answer(answer_subs)
-            result["question"] = q_label
+            result["question"] = "Q%s" % q_label
             result["question_text"] = ""  # only show boxed final answers
             result["n_submissions"] = len(subs)
 
             # Attach page images to each member
-            img_lookup = {sid: img for sid, _, _, img in subs}
+            img_lookup = {sid: img for sid, _, img in subs}
             for cluster in result["clusters"]:
                 for member in cluster["members"]:
                     ipath = img_lookup.get(member["id"], "")
