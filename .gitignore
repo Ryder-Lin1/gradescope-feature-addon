@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# Generated / runtime files
+uploads/
+textract_pages/
+textract_plots/
+cluster_plot.png
+textract_report.txt
+index.html
+
+# Secrets — never commit AWS credentials
+.env
+*.env
+start.sh
+app_backup.py

@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>ClusterGrade AI - Simple Demo</title>
+    <style>
+        body { font-family: Arial, sans-serif; max-width: 800px; margin: 50px auto; padding: 20px; }
+        h1 { color: #0075db; }
+        .button { background: #0075db; color: white; border: none; padding: 15px 30px; font-size: 16px; cursor: pointer; border-radius: 5px; margin: 10px 5px; }
+        .button:hover { background: #005baa; }
+        #status { margin-top: 20px; padding: 15px; background: #f5f7fa; border-radius: 5px; min-height: 100px; }
+        .success { color: green; font-weight: bold; }
+        .error { color: red; font-weight: bold; }
+        .info { color: #0075db; }
+        #fileList { margin: 20px 0; }
+        .file { display: inline-block; background: #eef4ff; color: #0075db; padding: 5px 10px; margin: 5px; border-radius: 15px; border: 1px solid #c4d9f8; }
+    </style>
+</head>
+<body>
+    <h1>📄 ClusterGrade AI - Demo</h1>
+    <p>This is a simple test to verify the backend is working.</p>
+    
+    <div>
+        <input type="file" id="fileInput" multiple accept=".pdf" style="display:none">
+        <button class="button" onclick="document.getElementById('fileInput').click()">Choose PDF Files</button>
+        <button class="button" onclick="testDemo()">Test Demo (Sample Files)</button>
+        <button class="button" onclick="uploadFiles()" id="uploadBtn" style="background:#27ae60">Upload & Analyze</button>
+    </div>
+    
+    <div id="fileList"></div>
+    <div id="status">
+        <p class="info">Click "Test Demo" to process sample files, or upload your own PDFs.</p>
+        <p class="info">Server must be running on http://localhost:8080</p>
+    </div>
+
+    <script>
+        let selectedFiles = [];
+        
+        document.getElementById('fileInput').addEventListener('change', function(e) {
+            selectedFiles = Array.from(e.target.files);
+            displayFiles();
+        });
+        
+        function displayFiles() {
+            const list = document.getElementById('fileList');
+            if (selectedFiles.length > 0) {
+                list.innerHTML = '<strong>Selected files:</strong><br>' + 
+                    selectedFiles.map(f => `<span class="file">${f.name}</span>`).join('');
+            } else {
+                list.innerHTML = '';
+            }
+        }
+        
+        async function testDemo() {
+            const status = document.getElementById('status');
+            status.innerHTML = '<p class="info">⏳ Testing demo endpoint...</p>';
+            
+            try {
+                const response = await fetch('http://localhost:8080/api/sample');
+                const data = await response.json();
+                
+                if (data.error) {
+                    status.innerHTML = `<p class="error">❌ Error: ${data.error}</p>`;
+                } else {
+                    status.innerHTML = `<p class="success">✅ Demo started! Job ID: ${data.job_id}</p>`;
+                    pollStatus(data.job_id);
+                }
+            } catch (error) {
+                status.innerHTML = `<p class="error">❌ Failed to connect to server: ${error.message}</p>
+                    <p>Make sure the server is running on http://localhost:8080</p>`;
+            }
+        }
+        
+        async function uploadFiles() {
+            if (selectedFiles.length === 0) {
+                alert('Please select PDF files first!');
+                return;
+            }
+            
+            const status = document.getElementById('status');
+            status.innerHTML = '<p class="info">⏳ Uploading files...</p>';
+            
+            try {
+                const formData = new FormData();
+                selectedFiles.forEach(file => formData.append('pdfs', file));
+                
+                const response = await fetch('http://localhost:8080/api/upload', {
+                    method: 'POST',
+                    body: formData
+                });
+                
+                const data = await response.json();
+                
+                if (data.error) {
+                    status.innerHTML = `<p class="error">❌ Error: ${data.error}</p>`;
+                } else {
+                    status.innerHTML = `<p class="success">✅ Upload successful! Job ID: ${data.job_id}</p>`;
+                    pollStatus(data.job_id);
+                }
+            } catch (error) {
+                status.innerHTML = `<p class="error">❌ Upload failed: ${error.message}</p>`;
+            }
+        }
+        
+        async function pollStatus(jobId) {
+            const status = document.getElementById('status');
+            
+            const interval = setInterval(async () => {
+                try {
+                    const response = await fetch(`http://localhost:8080/api/status/${jobId}`);
+                    const data = await response.json();
+                    
+                    status.innerHTML = `
+                        <p class="info">📊 Status: ${data.status}</p>
+                        <p>Progress: ${data.progress || 0}%</p>
+                        <p>${data.message || 'Processing...'}</p>
+                    `;
+                    
+                    if (data.status === 'done') {
+                        clearInterval(interval);
+                        status.innerHTML += `<p class="success">✅ Analysis complete!</p>
+                            <p>Found ${data.questions.length} questions</p>
+                            <p><a href="http://localhost:8080">View results in main interface</a></p>`;
+                    } else if (data.status === 'error') {
+                        clearInterval(interval);
+                        status.innerHTML = `<p class="error">❌ Error: ${data.message}</p>`;
+                    }
+                } catch (error) {
+                    clearInterval(interval);
+                    status.innerHTML = `<p class="error">❌ Status check failed: ${error.message}</p>`;
+                }
+            }, 1500);
+        }
+    </script>
+</body>
+</html>
